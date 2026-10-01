@@ -37,6 +37,8 @@ import io.github.jbellis.jvector.example.util.OnDiskGraphIndexCache;
 import io.github.jbellis.jvector.example.yaml.MetricSelection;
 import io.github.jbellis.jvector.graph.ImmutableGraphIndex;
 import io.github.jbellis.jvector.graph.GraphIndexBuilder;
+import io.github.jbellis.jvector.graph.GraphBuildAccelerator;
+import io.github.jbellis.jvector.graph.GraphBuildAccelerators;
 import io.github.jbellis.jvector.graph.GraphSearcher;
 import io.github.jbellis.jvector.graph.RandomAccessVectorValues;
 import io.github.jbellis.jvector.graph.disk.*;
@@ -56,6 +58,7 @@ import io.github.jbellis.jvector.quantization.ProductQuantization;
 import io.github.jbellis.jvector.quantization.VectorCompressor;
 import io.github.jbellis.jvector.util.ExplicitThreadLocal;
 import io.github.jbellis.jvector.util.PhysicalCoreExecutor;
+import io.github.jbellis.jvector.vector.VectorSimilarityFunction;
 import io.github.jbellis.jvector.vector.types.VectorFloat;
 
 import java.io.FileNotFoundException;
@@ -67,6 +70,8 @@ import java.nio.file.Paths;
 import java.util.*;
 import java.util.function.Function;
 import java.util.function.IntFunction;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Executors;
 import java.util.stream.IntStream;
 import java.util.function.Supplier;
 
@@ -427,8 +432,11 @@ public class Grid {
             throw new IllegalStateException("Bench looks for either NVQ_VECTORS or INLINE_VECTORS feature set for scoring compressed builds.");
         }
 
-        // build the graph incrementally
+        // build the graph incrementally, or with a GraphBuildAccelerator if one is selected
         long startTime = System.nanoTime();
+        // an accelerated build runs alongside the inline writes, as addGraphNode is interleaved with them below
+        var acceleratedBuild = startAcceleratedBuild(builder, floatVectors, ds.getSimilarityFunction());
+        boolean accelerated = acceleratedBuild != null;
         var vv = floatVectors.threadLocalSupplier();
         PhysicalCoreExecutor.pool().submit(() -> {
             IntStream.range(0, floatVectors.size()).parallel().forEach(node -> {
@@ -443,9 +451,14 @@ public class Grid {
                         throw new UncheckedIOException(e);
                     }
                 });
-                builder.addGraphNode(node, vv.get().getVector(node));
+                if (!accelerated) {
+                    builder.addGraphNode(node, vv.get().getVector(node));
+                }
             });
         }).join();
+        if (accelerated) {
+            acceleratedBuild.join();
+        }
         builder.cleanup();
 
         // write the edge lists and close the writers
@@ -590,7 +603,15 @@ public class Grid {
                                                           PhysicalCoreExecutor.pool(),
                                                           FilteredForkJoinPool.createFilteredPool());
         start = System.nanoTime();
-        var onHeapGraph = builder.build(floatVectors);
+        ImmutableGraphIndex onHeapGraph;
+        var acceleratedBuild = startAcceleratedBuild(builder, floatVectors, ds.getSimilarityFunction());
+        if (acceleratedBuild != null) {
+            acceleratedBuild.join();
+            builder.cleanup();
+            onHeapGraph = builder.getGraph();
+        } else {
+            onHeapGraph = builder.build(floatVectors);
+        }
         double buildTimeS = (System.nanoTime() - start) / 1_000_000_000.0;
         System.out.format("Build (%s) M=%d overflow=%.2f ef=%d in %.2fs%n",
                           "full res",
@@ -1282,6 +1303,27 @@ public class Grid {
                 try { return f.get(); }
                 finally { qs.encodeTimesS.add((System.nanoTime() - t0) / 1_000_000_000.0); }
             }
+        }
+    }
+
+    /**
+     * Starts the graph build on the {@link GraphBuildAccelerator} selected by {@code -Djvector.graph.accelerator}, in
+     * the background.
+     *
+     * @return the running build, or null when no accelerator is selected or it does not support the vectors
+     */
+    private static CompletableFuture<Void> startAcceleratedBuild(GraphIndexBuilder builder, RandomAccessVectorValues vectors,
+                                                                 VectorSimilarityFunction similarity) {
+        var accelerator = GraphBuildAccelerators.find();
+        if (accelerator.isEmpty() || !accelerator.get().supports(builder, vectors, similarity)) {
+            return null;
+        }
+        System.out.format("Building the graph with accelerator %s%n", accelerator.get().name());
+        var thread = Executors.newSingleThreadExecutor();
+        try {
+            return CompletableFuture.runAsync(() -> accelerator.get().build(builder, vectors, similarity), thread);
+        } finally {
+            thread.shutdown();
         }
     }
 }
